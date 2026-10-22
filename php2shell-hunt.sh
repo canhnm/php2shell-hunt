@@ -196,9 +196,15 @@ PATS=(
 phpext -mtime -"$DAYS" -print0 | xargs -0 -r grep -laE "${PATS[@]}" 2>/dev/null | emit '!' "recently modified PHP files with webshell patterns (eval/base64/\$_POST...)"
 
 # auto_prepend_file / auto_append_file with a value
-{ grep -rnE '^[[:space:]]*(auto_prepend_file|auto_append_file)[[:space:]]*=[[:space:]]*[^[:space:];]' /etc/php /etc/apache2 /etc/nginx 2>/dev/null; [ -n "$ROOTS" ] && grep -rnE '(auto_prepend_file|auto_append_file)[[:space:]]*[= ][[:space:]]*[^[:space:];]' $ROOTS --include=.htaccess --include=.user.ini --include=php.ini 2>/dev/null; } | emit '!' "auto_prepend_file / auto_append_file set to a value"
+APRE='^[[:space:]]*(php_(admin_)?value[[:space:]]+)?(auto_prepend_file|auto_append_file)([[:space:]]*=[[:space:]]*|[[:space:]]+)["'"'"']?[^[:space:];="'"'"'#]'
+APRE_OUT="$( { grep -rnE "$APRE" /etc/php /etc/apache2 /etc/nginx 2>/dev/null; [ -n "$ROOTS" ] && grep -rnE "$APRE" $ROOTS --include=.htaccess --include=.user.ini --include=php.ini 2>/dev/null; } | sort -u )"
+printf '%s\n' "$APRE_OUT" | grep -aivE 'wordfence-waf\.php' | emit '!' "auto_prepend_file / auto_append_file set to a value"
+printf '%s\n' "$APRE_OUT" | grep -aiE 'wordfence-waf\.php' | emit '?' "auto_prepend_file pointing to Wordfence WAF (legitimate if Wordfence is installed)"
 
-find /tmp /var/tmp /dev/shm -xdev -type f \( -iname '*.php*' -o -iname '*.sh' -o -iname '*.pl' -o -iname '*.py' -o -perm -u+x \) -printf '%TY-%Tm-%Td %TH:%TM %u %m %p\n' 2>/dev/null | sort -r | emit '!' "scripts/executables in /tmp, /var/tmp, /dev/shm"
+WEBUSERS="www-data nginx apache nobody"
+TMPFILES="$(find /tmp /var/tmp /dev/shm -xdev -type f \( -iname '*.php*' -o -iname '*.sh' -o -iname '*.pl' -o -iname '*.py' -o -perm -u+x \) -printf '%TY-%Tm-%Td %TH:%TM %u %m %p\n' 2>/dev/null | sort -r)"
+printf '%s\n' "$TMPFILES" | awk -v wu="$WEBUSERS" 'BEGIN{n=split(wu,a," ");for(i=1;i<=n;i++)w[a[i]]=1} ($3 in w)||$5 ~ /^\/dev\/shm\//' | emit '!' "scripts/executables in /tmp, /var/tmp, /dev/shm owned by the web user or in /dev/shm"
+printf '%s\n' "$TMPFILES" | awk -v wu="$WEBUSERS" 'BEGIN{n=split(wu,a," ");for(i=1;i<=n;i++)w[a[i]]=1} !(($3 in w)||$5 ~ /^\/dev\/shm\//)' | emit '?' "other scripts/executables in /tmp, /var/tmp (admin tooling and bundled CLIs are common; check owner and date)"
 find /tmp /var/tmp -xdev -maxdepth 1 -name '.*' ! -name '.' ! -name '..' ! -name '.X11-unix' ! -name '.ICE-unix' ! -name '.font-unix' ! -name '.Test-unix' ! -name '.XIM-unix' -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | emit '?' "hidden entries in /tmp, /var/tmp"
 echo "[i] stale PHP upload temp files (php*) in /tmp, /var/tmp: $(find /tmp /var/tmp -xdev -maxdepth 1 -type f -name 'php*' -mtime +0 2>/dev/null | wc -l)  (many = interrupted/crashed uploads)"
 
@@ -224,8 +230,25 @@ if [ -n "$LOGS" ]; then
     echo "[i] no IOC list -> skipping IOC IP matching"
   fi
   zc | timeout 240 grep -aiE 'php2shell-scan' | cut -c1-240 | emit '!' "user-agent php2shell-scan (known scanner)"
-  zc | timeout 240 grep -aiE 'php://|data://|expect://|phar://|zip://|%2e%2e%2f|\.\./\.\./|%00|PHP_SESSION_UPLOAD_PROGRESS|auto_prepend_file|allow_url_include|/proc/self/|/etc/passwd|[?&](cmd|exec|shell)=|base64_decode|eval\(|wget%20|curl%20|whoami|%24_(GET|POST)' | grep -aE '" (200|500) ' | cut -c1-240 | emit '!' "exploit-style URLs answered with 200/500"
-  zc | timeout 240 grep -aE '"(GET|POST) [^ ]*/(storage|uploads?|images|files|media|tmp|public)/[^ ?]*\.(php|phtml|phar|pht)[^ ]* HTTP[^"]*" (200|500)' | cut -c1-240 | emit '!' "successful requests to .php files inside upload directories"
+  zc | timeout 240 grep -aiE 'php://|data://|expect://|phar://|zip://|config-create|pearcmd|%2e%2e%2f|\.\./\.\./|%00|PHP_SESSION_UPLOAD_PROGRESS|auto_prepend_file|allow_url_include|/proc/self/|/etc/passwd|[?&](cmd|exec|shell)=|base64_decode|eval\(|wget%20|curl%20|whoami|%24_(GET|POST)' | grep -aE '" (200|500) ' | cut -c1-240 | emit '!' "exploit-style URLs answered with 200/500"
+  zc | timeout 240 grep -aiE 'config-create|pearcmd|php://|data://|expect://|phar://|%00|PHP_SESSION_UPLOAD_PROGRESS|auto_prepend_file|allow_url_include|/proc/self/|/etc/passwd' | grep -aoE '" [0-9]{3} ' | sort | uniq -c | emit 'i' "exploit-style URLs by HTTP status (count, status) - 4xx/3xx means the request did not execute"
+  UPHITS="$(zc | timeout 240 grep -aE '"(GET|POST) [^ ]*/(storage|uploads?|images|files|media|tmp|public)/[^ ?]*\.(php|phtml|phar|pht)[^ ]* HTTP[^"]*" (200|500)' | cut -c1-240)"
+  if [ -n "$UPHITS" ]; then
+    # keep only hits whose file really exists on disk; 200 for a missing file = catch-all/SPA route, not execution
+    UPPATHS="$(printf '%s\n' "$UPHITS" | grep -aoE '"(GET|POST) [^ ?]+' | awk '{print $2}' | sort -u | head -60)"
+    UPNAMES="$(printf '%s\n' "$UPPATHS" | awk -F/ '{print $NF}' | sort -u | sed 's/^/-o -name /' | tr '\n' ' ')"
+    ONDISK="$( [ -n "$ROOTS" ] && eval "timeout 120 nice -n 19 find $ROOTS -xdev -type f \( -false $UPNAMES \) -print" 2>/dev/null )"
+    EXISTS=0; MISSING=0; REAL=""; MISSLIST=""
+    for p in $UPPATHS; do
+      tail2="$(printf '%s' "$p" | awk -F/ '{print "/"$(NF-1)"/"$NF}')"
+      if printf '%s\n' "$ONDISK" | grep -qF -- "$tail2"; then EXISTS=$((EXISTS+1)); REAL="$REAL$p"$'\n'; else MISSING=$((MISSING+1)); MISSLIST="$MISSLIST$p"$'\n'; fi
+    done
+    [ -n "$REAL" ] && printf '%s\n' "$UPHITS" | grep -aF -f <(printf '%s' "$REAL" | sed '/^$/d') | emit '!' "successful requests to .php files inside upload directories (file exists on disk)" || echo "[ok] successful requests to .php files inside upload directories (file exists on disk): none"
+    echo "[i] .php-in-upload paths answered 200/500 but not present on disk: $MISSING (catch-all/error route, not execution); present on disk: $EXISTS"
+    [ "$MISSING" -gt 0 ] && printf '%s' "$MISSLIST" | head -5 | sed 's/^/[i]   e.g. /'
+  else
+    echo "[ok] successful requests to .php files inside upload directories: none"
+  fi
   zc | timeout 240 grep -aE '" 200 ' | grep -aoE '"(GET|POST|HEAD) [^ ?]+\.php' | awk '{print $2}' | sort | uniq -c | sort -rn | grep -vE ' /index\.php$' | head -25 | emit 'i' "PHP endpoints other than index.php answered with 200 (count, path) - look for odd or single-hit paths"
   zc | timeout 240 grep -aoE '\[[0-9]{2}/[A-Za-z]{3}/[0-9]{4}[^]]*\] "[^"]*" [0-9]{3}' | sed -E 's/^\[([0-9]{2}\/[A-Za-z]{3}\/[0-9]{4}).*" ([0-9]{3})$/\1 \2/' | awk '($2>=500)||$2==499||$2==413{c[$1" "$2]++} END{for(k in c) print c[k], k}' | sort -k2 | emit 'i' "5xx/499/413 responses per day (spikes may indicate crashes/OOM during exploitation)"
   zc | timeout 240 grep -aE '"POST [^"]*" 5[0-9]{2} ' | awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | emit 'i' "top client IPs with POST requests answered 5xx (behind a CDN this is the proxy IP)"
@@ -254,18 +277,20 @@ fi
 sec "4. CRASHES / OOM (worker failures that can accompany exploitation)"
 journalctl -k --since "-${DAYS}days" --no-pager 2>/dev/null | grep -aiE 'segfault|general protection|oom-kill|out of memory|killed process' | tail -15 | emit '?' "kernel: segfault/OOM"
 for f in /var/log/php*fpm*.log*; do [ -f "$f" ] && { case "$f" in *.gz) zcat "$f";; *) cat "$f";; esac; }
-done 2>/dev/null | grep -aE 'SIGSEGV|SIGABRT|SIGBUS|exited on signal|Allowed memory size|reached pm\.max_children' | tail -15 | emit '?' "php-fpm log: crashes / memory / max_children (check dates at the end of each line)"
+done 2>/dev/null | grep -aE 'SIGSEGV|SIGABRT|SIGBUS|exited on signal (4|6|7|8|11) |Allowed memory size|reached pm\.max_children' | tail -15 | emit '?' "php-fpm log: crashes / memory / max_children (check dates at the end of each line)"
 
 # ================= 5. BEHAVIOUR / PERSISTENCE =================
 sec "5. BEHAVIOUR: processes / network / persistence"
 # processes of the web user that are not web or common queue-worker processes (adjust the exclusion list to your stack)
-ps -eo user:20,pid,ppid,etime,args --no-headers 2>/dev/null | awk '$1=="www-data"||$1=="nginx"||$1=="apache"||$1=="nobody"' | grep -vE 'php-fpm|nginx:|apache2|httpd|php-cgi|supervisor|artisan|horizon|queue:work|redis' | emit '!' "processes of the web user that are not web/queue processes (shell? tool?)"
+ps -eo user:20,pid,ppid,etime,args --no-headers 2>/dev/null | awk '$1=="www-data"||$1=="nginx"||$1=="apache"||$1=="nobody"' | grep -vE 'php-fpm|nginx:|apache2|httpd|php-cgi|supervisor|artisan|horizon|queue:work|redis|<defunct>' | emit '!' "processes of the web user that are not web/queue processes (shell? tool?)"
 FPIDS=" $(pgrep -f 'php-fpm|apache2|httpd' 2>/dev/null | tr '\n' ' ') "
 ps -eo pid,ppid,user:20,comm,args --no-headers 2>/dev/null | awk -v p="$FPIDS" 'index(p," "$2" ")>0 && $4 ~ /^(sh|bash|dash|zsh|curl|wget|nc|ncat|socat|python[0-9.]*|perl|ruby|busybox|tar|chmod|crontab)$/' | emit '!' "shell/curl/wget running as a child of php-fpm/apache (PHP spawning shells or downloading files)"
 WU2=(); for u in www-data nginx apache nobody; do getent passwd "$u" >/dev/null 2>&1 && { [ ${#WU2[@]} -gt 0 ] && WU2+=(-o); WU2+=(-user "$u"); }; done
 [ ${#WU2[@]} -gt 0 ] && timeout 240 nice -n 19 find / -xdev \( -path /proc -o -path /sys -o -path /var/lib/php/sessions -o -path /var/cache -o -path /var/log -o -path /var/lib/mysql -o -path '*/storage' -o -path '*/bootstrap/cache' -o -path '*/node_modules' -o -path '*/.git' -o -path /tmp -o -path /var/tmp \) -prune -o -type f \( "${WU2[@]}" \) -mtime -"$DAYS" -printf '%TY-%Tm-%Td %TH:%TM %u %m %p\n' 2>/dev/null | sort -r | emit '?' "files created/modified by the web user outside storage/tmp/log in the last ${DAYS} days (payloads may land here)"
 ps -eo pid,user:20,args --no-headers 2>/dev/null | grep -aE 'nc -e|ncat |socat |/dev/tcp/|bash -i|python[0-9.]* -c .*socket|perl -e|xmrig|minerd|kdevtmpfsi|kinsing' | grep -v grep | emit '!' "processes resembling reverse shells / miners"
-ls -l /proc/[0-9]*/exe 2>/dev/null | grep ' (deleted)' | grep -v 'memfd:' | emit '!' "processes running from deleted binaries"
+DELBIN="$(ls -l /proc/[0-9]*/exe 2>/dev/null | grep ' (deleted)' | grep -v 'memfd:')"
+printf '%s\n' "$DELBIN" | grep -aE -- '-> (/tmp|/var/tmp|/dev/shm|/var/www|/home|/root|/run/user)' | emit '!' "processes running from deleted binaries in temp/web/home paths"
+printf '%s\n' "$DELBIN" | grep -avE -- '-> (/tmp|/var/tmp|/dev/shm|/var/www|/home|/root|/run/user)' | emit '?' "processes running from deleted system binaries (normally a package upgrade without restart; see needrestart)"
 ls -l /proc/[0-9]*/exe 2>/dev/null | grep 'memfd:' | emit '?' "processes running from memfd (fileless; some runtimes/agents do this legitimately)"
 ss -tnpH state established 2>/dev/null | grep -aE '"(sh|bash|dash|nc|ncat|socat|python[0-9.]*|perl|curl|wget|ruby)"' | emit '!' "established connections owned by shells/interpreters"
 [ -n "$IOC_RE" ] && ss -tnH 2>/dev/null | grep -aE "(^|[^0-9.])(${IOC_RE})([^0-9]|\$)" | emit '!' "connections to/from IOC IPs"
@@ -274,7 +299,8 @@ ss -tlnpH 2>/dev/null | awk '{print $4, $6}' | sort -u | emit 'i' "listening por
 awk -F: '$3==0 && $1!="root"{print}' /etc/passwd | emit '!' "UID 0 users other than root"
 find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron /etc/crontab /etc/rc.local -type f -mtime -"$DAYS" -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | emit '?' "cron/rc.local changed in the last ${DAYS} days"
 crontab -l -u www-data 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' | emit '?' "crontab of www-data (normally empty)"
-find /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system -type f -mtime -"$DAYS" -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | emit '?' "systemd units changed in the last ${DAYS} days (your own patching/hardening will show up here)"
+find /etc/systemd/system -type f -mtime -"$DAYS" -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | emit '?' "systemd units/drop-ins in /etc changed in the last ${DAYS} days (your own patching/hardening will show up here)"
+echo "[i] vendor systemd units changed in the last ${DAYS} days (package upgrades): $(find /usr/lib/systemd/system /lib/systemd/system -type f -mtime -"$DAYS" 2>/dev/null | wc -l)"
 find /root /home -maxdepth 3 \( -name authorized_keys -o -name authorized_keys2 \) -mtime -"$DAYS" -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | emit '!' "authorized_keys changed in the last ${DAYS} days"
 for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do [ -f "$f" ] && echo "$f: $(grep -c '^ssh-\|^ecdsa-\|^sk-' "$f") keys"; done | emit 'i' "number of keys in authorized_keys files"
 find /usr/bin /usr/sbin /bin /sbin /usr/local/bin /usr/local/sbin -xdev -type f -mtime -"$DAYS" -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | head -30 | emit '?' "system binaries changed in the last ${DAYS} days (package upgrades also cause this)"

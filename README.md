@@ -120,7 +120,16 @@ Tips:
   Compare timestamps with your change history.
 - For the error-log check, a steady trickle of memory-limit fatals is normal for many apps. Look for
   a **burst** from 17 Oct 2026 onward, especially from 21 Oct 2026 02:00 UTC.
-- Treat any webshell pattern, PHP file in an upload directory, shell spawned by php-fpm, or
+- Known sources of noise, already handled by the script but worth knowing when reading results:
+  `auto_prepend_file` pointing to Wordfence is demoted to `[?]`; scripts in `/tmp` are `[!]` only
+  when owned by the web user or located in `/dev/shm`; zombie (`<defunct>`) workers and
+  `exited on signal 15` (SIGTERM) are ignored; deleted binaries are `[!]` only when they lived in
+  temp, web or home paths (system binaries replaced by a package upgrade are `[?]`).
+- Requests for `.php` files in upload directories only count as `[!]` when the file actually exists
+  on disk. Many apps answer 200 for any unknown path (catch-all route), so a 200 for a missing
+  file is reported as `[i]` instead. Exploit-style URLs are also summarised by HTTP status:
+  4xx/3xx responses did not execute.
+- - Treat any webshell pattern, PHP file in an upload directory, shell spawned by php-fpm, or
   connection to an IOC IP as a real incident until proven otherwise.
 
 ## Limitations
