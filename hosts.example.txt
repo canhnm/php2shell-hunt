@@ -1,0 +1,5 @@
+# One server per line:  label host [port]      ("#" starts a comment)
+# Addresses below are documentation placeholders (RFC 5737) - replace with your own.
+web-01 203.0.113.10
+web-02 203.0.113.11 2222
+198.51.100.7

@@ -1,0 +1,4 @@
+# Never commit your real server list, IOC extras or scan results
+hosts.txt
+iocs.txt
+php2shell-hunt-*/
